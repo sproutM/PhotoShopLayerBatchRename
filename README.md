@@ -1,0 +1,2 @@
+# PhotoShopLayerBatchRename
+PhotoShop对图层批量重命名
