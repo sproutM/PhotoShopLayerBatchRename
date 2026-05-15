@@ -1,4 +1,4 @@
-# LayerBatchRename 脚本 — 报错说明文档
+# LayerBatchRename 说明文档
 
 ## 脚本信息
 
