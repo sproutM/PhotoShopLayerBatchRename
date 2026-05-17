@@ -3,7 +3,7 @@
 在Photoshop中多选图层进行批量重命名的工具
 自动生成图层名称表达式、保留差异内容和图层序号生成
 
-<img width="580" height="535" alt="image" src="https://github.com/user-attachments/assets/be298e9e-6258-4053-9a3a-7b975178a0d6" />
+<img width="577" height="565" alt="image" src="https://github.com/user-attachments/assets/4208152d-c6b3-4ec6-9df2-b3c58290a23b" />
 
 ***
 
@@ -42,7 +42,7 @@
 
 "位数"控制序号补零：位数 = 3 即补零至 3 位（如 001）。
 
-<img width="585" height="529" alt="image" src="https://github.com/user-attachments/assets/3fd9d872-a44d-4827-a24d-c3793908808b" />
+<img width="580" height="565" alt="image" src="https://github.com/user-attachments/assets/9e017c76-b4c0-4c41-8fee-282c1e7a31dd" />
 
 ### 序号规则
 
