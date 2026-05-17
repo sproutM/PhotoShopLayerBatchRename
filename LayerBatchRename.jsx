@@ -1,10 +1,29 @@
 #target photoshop
 
 var SCRIPT_NAME = "批量重命名图层";
-var SCRIPT_VERSION = "1.0.0";
+var SCRIPT_VERSION = "1.0.2";
 var ERROR_LOG_FILE = "LayerBatchRename_ErrorLog.txt";
+var SETTINGS_FILE = "LayerBatchRename_Settings.ini";
 var VAR_CHARS = "1234567890abcefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 var MAX_VARS = VAR_CHARS.length;
+var _varCharPosMap = null;
+var _escapeRegexMap = null;
+
+function initLookupMaps() {
+    if (!_varCharPosMap) {
+        _varCharPosMap = {};
+        for (var i = 0; i < VAR_CHARS.length; i++) {
+            _varCharPosMap[VAR_CHARS.charAt(i)] = i + 1;
+        }
+    }
+    if (!_escapeRegexMap) {
+        _escapeRegexMap = {};
+        var special = "\\^$.*+?()[]{}|";
+        for (var j = 0; j < special.length; j++) {
+            _escapeRegexMap[special.charAt(j)] = true;
+        }
+    }
+}
 
 var ERROR_CODES = {
     E001: { msg: "未打开任何文档", detail: "请先在 Photoshop 中打开一个文档后再运行此脚本。" },
@@ -18,6 +37,10 @@ var ERROR_CODES = {
 };
 
 var _layerData = [];
+var _originalSelectedIDs = [];
+var _logFilePathCache = null;
+var _originalLayerDataCache = null;
+var _childrenLayerDataCache = null;
 
 function posToVarChar(pos) {
     if (pos < 1 || pos > MAX_VARS) return null;
@@ -25,6 +48,10 @@ function posToVarChar(pos) {
 }
 
 function varCharToPos(ch) {
+    if (_varCharPosMap) {
+        var pos = _varCharPosMap[ch];
+        return pos !== undefined ? pos : -1;
+    }
     var idx = VAR_CHARS.indexOf(ch);
     return idx >= 0 ? idx + 1 : -1;
 }
@@ -46,11 +73,16 @@ function showError(code, extra) {
 }
 
 function getLogFilePath() {
+    if (_logFilePathCache) return _logFilePathCache;
     try {
         var tempFolder = Folder.temp;
-        if (tempFolder && tempFolder.exists) return tempFolder.fsName + "/" + ERROR_LOG_FILE;
+        if (tempFolder && tempFolder.exists) {
+            _logFilePathCache = tempFolder.fsName + "/" + ERROR_LOG_FILE;
+            return _logFilePathCache;
+        }
     } catch (e) {}
-    return Folder.desktop.fsName + "/" + ERROR_LOG_FILE;
+    _logFilePathCache = Folder.desktop.fsName + "/" + ERROR_LOG_FILE;
+    return _logFilePathCache;
 }
 
 function logError(code, extra) {
@@ -62,6 +94,52 @@ function logError(code, extra) {
         logFile.open("a");
         logFile.write(logEntry);
         logFile.close();
+    } catch (e) {}
+}
+
+function getSettingsFilePath() {
+    try {
+        var userData = Folder.userData;
+        if (userData && userData.exists) return userData.fsName + "/" + SETTINGS_FILE;
+    } catch (e) {}
+    return Folder.temp.fsName + "/" + SETTINGS_FILE;
+}
+
+function loadSettings() {
+    var settings = { excludeGroups: false, excludeLayers: false, seqPad: "0", reverse: false };
+    try {
+        var file = new File(getSettingsFilePath());
+        if (file.exists) {
+            file.open("r");
+            var content = file.read();
+            file.close();
+            var lines = content.split("\n");
+            for (var i = 0; i < lines.length; i++) {
+                var eqIdx = lines[i].indexOf("=");
+                if (eqIdx > 0) {
+                    var key = lines[i].substring(0, eqIdx).replace(/^\s+|\s+$/g, "");
+                    var val = lines[i].substring(eqIdx + 1).replace(/^\s+|\s+$/g, "");
+                    if (key === "excludeGroups") settings.excludeGroups = (val === "true");
+                    else if (key === "excludeLayers") settings.excludeLayers = (val === "true");
+                    else if (key === "seqPad") settings.seqPad = val;
+                    else if (key === "reverse") settings.reverse = (val === "true");
+                }
+            }
+        }
+    } catch (e) {}
+    return settings;
+}
+
+function saveSettings(dlg) {
+    try {
+        var content = "excludeGroups=" + dlg.excludeGroupsCheck.value + "\n" +
+                      "excludeLayers=" + dlg.excludeLayersCheck.value + "\n" +
+                      "seqPad=" + dlg.seqPadInput.text + "\n" +
+                      "reverse=" + dlg.reverseCheck.value;
+        var file = new File(getSettingsFilePath());
+        file.open("w");
+        file.write(content);
+        file.close();
     } catch (e) {}
 }
 
@@ -289,6 +367,7 @@ function analyzePattern(names) {
 }
 
 function escapeRegexChar(c) {
+    if (_escapeRegexMap && _escapeRegexMap[c]) return "\\" + c;
     if ("\\^$.*+?()[]{}|".indexOf(c) !== -1) return "\\" + c;
     return c;
 }
@@ -320,9 +399,9 @@ function expressionToRegex(expr) {
     return new RegExp(regexStr);
 }
 
-function extractVariables(name, expr) {
+function extractVariables(name, expr, cachedRegex) {
     try {
-        var regex = expressionToRegex(expr);
+        var regex = cachedRegex || expressionToRegex(expr);
         var match = name.match(regex);
         if (!match) return null;
         return match.slice(1);
@@ -376,17 +455,172 @@ function selectLayerByID(id) {
     executeAction(charIDToTypeID("slct"), desc, DialogModes.NO);
 }
 
+function cloneLayerData(arr) {
+    var result = [];
+    for (var i = 0; i < arr.length; i++) {
+        var d = arr[i];
+        result.push({ id: d.id, name: d.name, isGroup: d.isGroup, itemIndex: d.itemIndex, newName: null });
+    }
+    return result;
+}
+
+function addChildrenFromDOM(parentLayer, dataArr, seenIDs) {
+    var layers = parentLayer.layers;
+    for (var i = 0; i < layers.length; i++) {
+        var layer = layers[i];
+        var id = layer.id;
+        if (!seenIDs[id]) {
+            seenIDs[id] = true;
+            dataArr.push({
+                id: id,
+                name: layer.name,
+                isGroup: (layer.typename === "LayerSet"),
+                itemIndex: 0,
+                newName: null
+            });
+        }
+        if (layer.typename === "LayerSet") {
+            addChildrenFromDOM(layer, dataArr, seenIDs);
+        }
+    }
+}
+
+function updateCachesAfterApply() {
+    var nameMap = {};
+    for (var i = 0; i < _layerData.length; i++) {
+        nameMap[_layerData[i].id] = _layerData[i].name;
+    }
+    if (_originalLayerDataCache) {
+        for (var j = 0; j < _originalLayerDataCache.length; j++) {
+            var n1 = nameMap[_originalLayerDataCache[j].id];
+            if (n1 !== undefined) _originalLayerDataCache[j].name = n1;
+        }
+    }
+    if (_childrenLayerDataCache) {
+        for (var k = 0; k < _childrenLayerDataCache.length; k++) {
+            var n2 = nameMap[_childrenLayerDataCache[k].id];
+            if (n2 !== undefined) _childrenLayerDataCache[k].name = n2;
+        }
+    }
+}
+
+function rebuildLayerData(dlg) {
+    var includeChildren = dlg.includeChildrenCheck.value;
+
+    if (!includeChildren) {
+        if (_originalLayerDataCache) {
+            _layerData = cloneLayerData(_originalLayerDataCache);
+        } else {
+            _layerData = [];
+            for (var r = 0; r < _originalSelectedIDs.length; r++) {
+                _layerData.push(cacheLayerInfo(_originalSelectedIDs[r]));
+            }
+            _layerData.sort(function(a, b) { return b.itemIndex - a.itemIndex; });
+            _originalLayerDataCache = cloneLayerData(_layerData);
+        }
+
+        dlg.origList.visible = false;
+        dlg.origList.removeAll();
+        for (var n = 0; n < _layerData.length; n++) {
+            var rld = _layerData[n];
+            var rprefix = rld.isGroup ? "[图层组] " : "[图层] ";
+            dlg.origList.add("item", rprefix + rld.name);
+        }
+        dlg.origList.visible = true;
+
+        regenerateExpression(dlg);
+        return;
+    }
+
+    if (_childrenLayerDataCache) {
+        _layerData = cloneLayerData(_childrenLayerDataCache);
+    } else {
+        if (!_originalLayerDataCache) {
+            var tempData = [];
+            for (var t = 0; t < _originalSelectedIDs.length; t++) {
+                tempData.push(cacheLayerInfo(_originalSelectedIDs[t]));
+            }
+            tempData.sort(function(a, b) { return b.itemIndex - a.itemIndex; });
+            _originalLayerDataCache = cloneLayerData(tempData);
+        }
+
+        _layerData = [];
+        var seenIDs = {};
+
+        for (var j = 0; j < _originalLayerDataCache.length; j++) {
+            var orig = _originalLayerDataCache[j];
+            if (!seenIDs[orig.id]) {
+                seenIDs[orig.id] = true;
+                _layerData.push({ id: orig.id, name: orig.name, isGroup: orig.isGroup, itemIndex: orig.itemIndex, newName: null });
+            }
+
+            if (orig.isGroup) {
+                selectLayerByID(orig.id);
+                var group = app.activeDocument.activeLayer;
+                addChildrenFromDOM(group, _layerData, seenIDs);
+            }
+        }
+
+        _childrenLayerDataCache = cloneLayerData(_layerData);
+    }
+
+    dlg.origList.visible = false;
+    dlg.origList.removeAll();
+    for (var p = 0; p < _layerData.length; p++) {
+        var pld = _layerData[p];
+        var pprefix = pld.isGroup ? "[图层组] " : "[图层] ";
+        dlg.origList.add("item", pprefix + pld.name);
+    }
+    dlg.origList.visible = true;
+
+    regenerateExpression(dlg);
+}
+
 function _lso_applyRename() {
+    var doc = app.activeDocument;
     for (var i = 0; i < _layerData.length; i++) {
         var ld = _layerData[i];
+        if (ld.excluded) continue;
         if (ld.newName === null || ld.newName === "" || ld.newName === ld.name) continue;
         try {
             selectLayerByID(ld.id);
-            app.activeDocument.activeLayer.name = ld.newName;
+            doc.activeLayer.name = ld.newName;
         } catch (e) {
             logError("E201", "图层 '" + ld.name + "' 重命名失败: " + e.message);
         }
     }
+}
+
+function regenerateExpression(dlg) {
+    var excludeGroups = dlg.excludeGroupsCheck.value;
+    var excludeLayers = dlg.excludeLayersCheck.value;
+
+    var activeNames = [];
+    for (var i = 0; i < _layerData.length; i++) {
+        var ld = _layerData[i];
+        var isExcluded = (excludeGroups && ld.isGroup) || (excludeLayers && !ld.isGroup);
+        if (!isExcluded) {
+            activeNames.push(ld.name);
+        }
+    }
+
+    if (activeNames.length === 0) {
+        dlg.origExpr.text = "";
+        dlg.newExpr.text = "";
+        updatePreview(dlg);
+        return;
+    }
+
+    var pattern = analyzePattern(activeNames);
+    if (pattern.error) {
+        dlg.origExpr.text = activeNames[0];
+        dlg.newExpr.text = activeNames[0];
+    } else {
+        dlg.origExpr.text = pattern.expression;
+        dlg.newExpr.text = pattern.expression;
+    }
+
+    updatePreview(dlg);
 }
 
 function updatePreview(dlg) {
@@ -404,29 +638,59 @@ function updatePreview(dlg) {
         if (isNaN(step)) step = 1;
 
         var n = _layerData.length;
+        dlg.newList.visible = false;
+        dlg.origList.visible = false;
         dlg.newList.removeAll();
         var reverse = dlg.reverseCheck.value;
+        var excludeGroups = dlg.excludeGroupsCheck.value;
+        var excludeLayers = dlg.excludeLayersCheck.value;
 
+        var cachedRegex = null;
+        try { cachedRegex = expressionToRegex(origExpr); } catch (e) {}
+
+        var nonExcludedCount = 0;
+        for (var k = 0; k < n; k++) {
+            var ldK = _layerData[k];
+            var isExclK = (excludeGroups && ldK.isGroup) || (excludeLayers && !ldK.isGroup);
+            ldK.excluded = isExclK;
+            if (!isExclK) nonExcludedCount++;
+        }
+
+        var seqIdx = 0;
+        var GROUP_PREFIX = "[图层组] ";
+        var LAYER_PREFIX = "[图层] ";
         for (var i = 0; i < n; i++) {
             var ld = _layerData[i];
-            var variables = extractVariables(ld.name, origExpr);
-            var seqNum = reverse ? start + i * step : start + (n - 1 - i) * step;
-            var prefix = ld.isGroup ? "[图层组] " : "[图层] ";
+            var prefix = ld.isGroup ? GROUP_PREFIX : LAYER_PREFIX;
 
-            if (variables === null) {
-                ld.newName = null;
-                dlg.newList.add("item", prefix + "[不匹配]");
+            if (ld.excluded) {
+                ld.newName = ld.name;
+                var exclItem = dlg.newList.add("item", prefix + ld.name);
+                exclItem.enabled = false;
+                if (dlg.origList.items[i]) dlg.origList.items[i].enabled = false;
             } else {
-                ld.variables = variables;
-                var newName = generateNewName(newExpr, variables, seqNum, seqPad);
-                ld.newName = newName;
-                if (newName === "") {
-                    dlg.newList.add("item", prefix + "[空名称]");
+                var variables = extractVariables(ld.name, origExpr, cachedRegex);
+                var seqNum = reverse ? start + seqIdx * step : start + (nonExcludedCount - 1 - seqIdx) * step;
+                seqIdx++;
+
+                if (variables === null) {
+                    ld.newName = null;
+                    dlg.newList.add("item", prefix + "[不匹配]");
                 } else {
-                    dlg.newList.add("item", prefix + newName);
+                    ld.variables = variables;
+                    var newName = generateNewName(newExpr, variables, seqNum, seqPad);
+                    ld.newName = newName;
+                    if (newName === "") {
+                        dlg.newList.add("item", prefix + "[空名称]");
+                    } else {
+                        dlg.newList.add("item", prefix + newName);
+                    }
                 }
+                if (dlg.origList.items[i]) dlg.origList.items[i].enabled = true;
             }
         }
+        dlg.newList.visible = true;
+        dlg.origList.visible = true;
     } catch (e) {}
 }
 
@@ -436,6 +700,7 @@ function doValidate() {
 
     for (var i = 0; i < _layerData.length; i++) {
         var ld = _layerData[i];
+        if (ld.excluded) continue;
         if (ld.newName === null) {
             hasMismatch = true;
         } else if (ld.newName === "") {
@@ -471,6 +736,7 @@ function doApply(dlg) {
 
         var hasChange = false;
         for (var j = 0; j < _layerData.length; j++) {
+            if (_layerData[j].excluded) continue;
             if (_layerData[j].newName !== null && _layerData[j].newName !== _layerData[j].name) {
                 hasChange = true;
                 break;
@@ -481,6 +747,7 @@ function doApply(dlg) {
         var nameSet = {};
         var duplicates = [];
         for (var i = 0; i < _layerData.length; i++) {
+            if (_layerData[i].excluded) continue;
             var nm = _layerData[i].newName;
             if (nm !== null && nm !== "") {
                 if (nameSet[nm]) {
@@ -499,10 +766,13 @@ function doApply(dlg) {
         }
 
         for (var i = 0; i < _layerData.length; i++) {
+            if (_layerData[i].excluded) continue;
             if (_layerData[i].newName !== null && _layerData[i].newName !== _layerData[i].name) {
                 _layerData[i].name = _layerData[i].newName;
             }
         }
+
+        updateCachesAfterApply();
 
         if (duplicates.length > 0) {
             var uniqueDups = [];
@@ -527,19 +797,27 @@ function doApply(dlg) {
 
 function refreshDialogAfterApply(dlg) {
     try {
-        var names = [];
-        for (var i = 0; i < _layerData.length; i++) {
-            names.push(_layerData[i].name);
+        var excludeGroups = dlg.excludeGroupsCheck.value;
+        var excludeLayers = dlg.excludeLayersCheck.value;
+
+        var activeNames = [];
+        for (var a = 0; a < _layerData.length; a++) {
+            var ald = _layerData[a];
+            var aExcl = (excludeGroups && ald.isGroup) || (excludeLayers && !ald.isGroup);
+            if (!aExcl) activeNames.push(ald.name);
         }
 
-        var pattern = analyzePattern(names);
+        var pattern = activeNames.length > 0 ? analyzePattern(activeNames) : { expression: "", varCount: 0 };
 
+        dlg.origList.visible = false;
         dlg.origList.removeAll();
         for (var i = 0; i < _layerData.length; i++) {
             var ld = _layerData[i];
             var prefix = ld.isGroup ? "[图层组] " : "[图层] ";
-            dlg.origList.add("item", prefix + ld.name);
+            var origItem = dlg.origList.add("item", prefix + ld.name);
+            if (ld.excluded) origItem.enabled = false;
         }
+        dlg.origList.visible = true;
 
         dlg.origExpr.text = pattern.expression;
         dlg.newExpr.text = pattern.expression;
@@ -577,12 +855,14 @@ function createDialog() {
     dlg.newList.preferredSize = [240, 200];
 
     var names = [];
+    dlg.origList.visible = false;
     for (var i = 0; i < _layerData.length; i++) {
         var ld = _layerData[i];
         var prefix = ld.isGroup ? "[图层组] " : "[图层] ";
         names.push(ld.name);
         dlg.origList.add("item", prefix + ld.name);
     }
+    dlg.origList.visible = true;
 
     var pattern = analyzePattern(names);
     if (pattern.error) {
@@ -591,6 +871,16 @@ function createDialog() {
         return null;
     }
 
+    var excludeGroup = dlg.add("group");
+    excludeGroup.orientation = "row";
+    excludeGroup.alignChildren = ["left", "center"];
+    dlg.excludeGroupsCheck = excludeGroup.add("checkbox", undefined, "排除图层组");
+    dlg.excludeGroupsCheck.helpTip = "开启后不对图层组进行重命名";
+    dlg.excludeLayersCheck = excludeGroup.add("checkbox", undefined, "排除图层");
+    dlg.excludeLayersCheck.helpTip = "开启后不对普通图层进行重命名";
+    dlg.includeChildrenCheck = excludeGroup.add("checkbox", undefined, "获取子对象");
+    dlg.includeChildrenCheck.helpTip = "开启后将选中图层组的所有子对象加入列表";
+
     var origExprGroup = dlg.add("group");
     origExprGroup.orientation = "row";
     origExprGroup.alignChildren = ["left", "center"];
@@ -598,6 +888,11 @@ function createDialog() {
     dlg.origExpr = origExprGroup.add("edittext", undefined, pattern.expression);
     dlg.origExpr.alignment = ["fill", "center"];
     dlg.origExpr.helpTip = "图层名模式，%1~%9 匹配变量部分（含空串和空格）";
+    dlg.resetExprBtn = origExprGroup.add("button", undefined, "重置");
+    dlg.resetExprBtn.preferredSize = [36, 22];
+    dlg.resetExprBtn.maximumSize = [36, 22];
+    dlg.resetExprBtn.alignment = ["right", "center"];
+    dlg.resetExprBtn.helpTip = "根据当前图层名重新生成表达式";
 
     var newExprGroup = dlg.add("group");
     newExprGroup.orientation = "row";
@@ -652,7 +947,7 @@ function createDialog() {
     var cancelBtn = btnGroup.add("button", undefined, "取消");
 
     githubBtn.onClick = function() {
-        var url = "https://github.com/sproutM/PhotoShopLayerBatchRename";
+        var url = "https://github.com/TheMorningCat/PhotoShopLayerBatchRename";
         try {
             var tempFile = new File(Folder.temp.fsName + "/ps_clipboard_url.txt");
             tempFile.open("w");
@@ -671,28 +966,68 @@ function createDialog() {
     };
 
     cancelBtn.onClick = function() {
+        saveSettings(dlg);
         dlg.close(0);
     };
 
     applyBtn.onClick = function() {
         try {
+            okBtn.text = "修改中";
+            okBtn.enabled = false;
+            applyBtn.enabled = false;
+            dlg.update();
             if (doApply(dlg)) {
+                saveSettings(dlg);
                 refreshDialogAfterApply(dlg);
             }
         } catch (e) {
             alert("应用操作出现错误: " + e.message, SCRIPT_NAME + " — 错误", true);
         }
+        okBtn.text = "确定";
+        okBtn.enabled = true;
+        applyBtn.enabled = true;
     };
 
     okBtn.onClick = function() {
         try {
+            okBtn.text = "修改中";
+            okBtn.enabled = false;
+            applyBtn.enabled = false;
+            dlg.update();
             if (doApply(dlg)) {
+                saveSettings(dlg);
                 dlg.close(1);
+                return;
             }
         } catch (e) {
             alert("操作出现错误: " + e.message, SCRIPT_NAME + " — 错误", true);
         }
+        okBtn.text = "确定";
+        okBtn.enabled = true;
+        applyBtn.enabled = true;
     };
+
+    var savedSettings = loadSettings();
+    dlg.excludeGroupsCheck.value = savedSettings.excludeGroups;
+    dlg.excludeLayersCheck.value = savedSettings.excludeLayers;
+    dlg.seqPadInput.text = savedSettings.seqPad;
+    dlg.reverseCheck.value = savedSettings.reverse;
+
+    if (savedSettings.excludeGroups || savedSettings.excludeLayers) {
+        var activeNames = [];
+        for (var si = 0; si < _layerData.length; si++) {
+            var sld = _layerData[si];
+            var sExcluded = (savedSettings.excludeGroups && sld.isGroup) || (savedSettings.excludeLayers && !sld.isGroup);
+            if (!sExcluded) activeNames.push(sld.name);
+        }
+        if (activeNames.length > 0) {
+            var sPattern = analyzePattern(activeNames);
+            if (!sPattern.error) {
+                dlg.origExpr.text = sPattern.expression;
+                dlg.newExpr.text = sPattern.expression;
+            }
+        }
+    }
 
     dlg.origList.onChange = function() {
         if (dlg.origList.selection !== null) {
@@ -717,6 +1052,10 @@ function createDialog() {
     dlg.stepInput.onChange = function() { updatePreview(dlg); };
     dlg.seqPadInput.onChange = function() { updatePreview(dlg); };
     dlg.reverseCheck.onClick = function() { updatePreview(dlg); };
+    dlg.excludeGroupsCheck.onClick = function() { regenerateExpression(dlg); };
+    dlg.excludeLayersCheck.onClick = function() { regenerateExpression(dlg); };
+    dlg.resetExprBtn.onClick = function() { regenerateExpression(dlg); };
+    dlg.includeChildrenCheck.onClick = function() { rebuildLayerData(dlg); };
 
     updatePreview(dlg);
 
@@ -724,6 +1063,7 @@ function createDialog() {
 }
 
 function main() {
+    initLookupMaps();
     if (!checkEnvironment()) return;
 
     var selectedIDs = getSelectedLayerIDs();
@@ -732,6 +1072,8 @@ function main() {
         showError("E002");
         return;
     }
+
+    _originalSelectedIDs = selectedIDs.slice();
 
     _layerData = [];
     for (var i = 0; i < selectedIDs.length; i++) {
